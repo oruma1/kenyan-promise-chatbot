@@ -1,0 +1,53 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ===== Virtual Environment =====
+venv/
+env/
+ENV/
+.venv/
+
+# ===== Data (large + generated) =====
+data/chroma_db/
+data/chatbot.db
+data/users.json
+data/documents/*.pdf
+logs/
+*.log
+
+# ===== ML Models (huge, auto-downloaded) =====
+.cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# ===== Environment =====
+.env
+.env.local
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== Streamlit =====
+.streamlit/secrets.toml
+
+# ===== OS =====
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ===== Evaluation outputs =====
+evaluation_results.csv
+*.xlsx
