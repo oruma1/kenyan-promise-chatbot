@@ -14,10 +14,6 @@ def _hash(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
-# ============================================================
-# PUBLIC API
-# ============================================================
-
 def register_user(username: str, password: str, role: str = "citizen") -> Tuple[bool, str]:
     """Register a new user. Returns (success, message)."""
     username = username.strip().lower()
@@ -54,7 +50,6 @@ def authenticate(username: str, password: str) -> Tuple[bool, Optional[str]]:
     if not row.get("is_active", 1):
         return False, None
     if row["password_hash"] == _hash(password):
-        # Update last_login
         execute(
             "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE username = ?",
             (username,)
@@ -64,7 +59,7 @@ def authenticate(username: str, password: str) -> Tuple[bool, Optional[str]]:
 
 
 def list_users() -> dict:
-    """Return {username: {role: ...}} for all active users."""
+    """Return {username: {role: ...}} for all users."""
     rows = fetch_all(
         "SELECT username, role, created_at, last_login FROM users ORDER BY username"
     )
@@ -92,5 +87,8 @@ def delete_user(username: str) -> Tuple[bool, str]:
 
 def get_user_id(username: str) -> Optional[int]:
     """Look up a user's ID by username. Used for logging."""
-    row = fetch_one("SELECT user_id FROM users WHERE username = ?", (username.strip().lower(),))
+    row = fetch_one(
+        "SELECT user_id FROM users WHERE username = ?",
+        (username.strip().lower(),)
+    )
     return row["user_id"] if row else None

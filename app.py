@@ -8,8 +8,10 @@ from src.retriever import Retriever
 from src.generator import Generator
 from src.citation_manager import CitationManager
 from src.config import Config
-from src.auth import authenticate, register_user, list_users, delete_user, ROLES
+from src.auth import authenticate, register_user, list_users, delete_user, ROLES, get_user_id
 from src.evaluator import bm25_baseline, precision_at_k
+from src import logging_db
+
 
 
 st.set_page_config(
@@ -26,6 +28,8 @@ for key, default in {
     "role": "",
     "show_register": False,
     "feedback": {},
+"last_query": None,
+    "last_response": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -126,30 +130,77 @@ def chatbot_panel(top_k: int, show_chunks: bool):
     )
 
     if query:
-        with st.spinner("Searching and generating..."):
-            start = time.time()
-            retrieved = retriever.retrieve(query, top_k=top_k)
-            retrieval_time = time.time() - start
+        user_id = get_user_id(st.session_state.username)
+        if user_id is None:
+            st.error("Could not identify your user account. Please log out and log back in.")
+            return
 
-            has_evidence = retriever.has_sufficient_evidence(retrieved)
-            filtered = [r for r in retrieved if r["similarity"] >= Config.SIMILARITY_THRESHOLD]
+        # Only run the pipeline if this is a NEW query
+        last_query = st.session_state.get("last_query", None)
 
-            start = time.time()
-            result = generator.generate(query, filtered) if has_evidence else {
-                "answer": "I do not have sufficient evidence in the corpus to answer this question.",
-                "has_evidence": False
+        if last_query != query:
+            # ---- NEW QUERY: run retrieval + generation + log ----
+            query_id = logging_db.log_query(user_id, query)
+
+            with st.spinner("Searching and generating..."):
+                start = time.time()
+                retrieved = retriever.retrieve(query, top_k=top_k)
+                retrieval_ms = int((time.time() - start) * 1000)
+
+                has_evidence = retriever.has_sufficient_evidence(retrieved)
+                filtered = [r for r in retrieved if r["similarity"] >= Config.SIMILARITY_THRESHOLD]
+
+                start = time.time()
+                result = generator.generate(query, filtered) if has_evidence else {
+                    "answer": "I do not have sufficient evidence in the corpus to answer this question.",
+                    "has_evidence": False
+                }
+                generation_ms = int((time.time() - start) * 1000)
+
+            response_id = logging_db.log_response(
+                query_id=query_id,
+                response_text=result["answer"],
+                retrieval_ms=retrieval_ms,
+                generation_ms=generation_ms,
+                model_version=Config.LLM_MODEL
+            )
+            if has_evidence and filtered:
+                logging_db.log_citations(response_id, filtered)
+                logging_db.mark_query_answered(query_id)
+
+            # Cache the result so button clicks don't re-run the pipeline
+            st.session_state["last_query"] = query
+            st.session_state["last_response"] = {
+                "query_id": query_id,
+                "response_id": response_id,
+                "answer": result["answer"],
+                "has_evidence": result["has_evidence"],
+                "retrieved": filtered,
+                "retrieval_ms": retrieval_ms,
+                "generation_ms": generation_ms,
             }
-            gen_time = time.time() - start
+
+        # ---- DISPLAY: always pull from session state ----
+        cached = st.session_state.get("last_response", None)
+        if not cached:
+            return
+
+        response_id = cached["response_id"]
+        retrieval_ms = cached["retrieval_ms"]
+        generation_ms = cached["generation_ms"]
+        filtered = cached["retrieved"]
+        answer = cached["answer"]
+        has_evidence = cached["has_evidence"]
 
         st.markdown("### Answer")
-        if result["has_evidence"]:
-            st.success(result["answer"])
+        if has_evidence:
+            st.success(answer)
         else:
-            st.warning(result["answer"])
+            st.warning(answer)
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("Retrieval", f"{retrieval_time:.2f}s")
-        c2.metric("Generation", f"{gen_time:.2f}s")
+        c1.metric("Retrieval", f"{retrieval_ms / 1000:.2f}s")
+        c2.metric("Generation", f"{generation_ms / 1000:.2f}s")
         c3.metric("Chunks used", len(filtered))
 
         if filtered:
@@ -164,20 +215,30 @@ def chatbot_panel(top_k: int, show_chunks: bool):
                 with st.expander(f"Chunk {i}"):
                     st.text(ch["text"])
 
-        # Feedback
+        # ---- FEEDBACK: stable key based on response_id ----
         st.markdown("### Was this answer helpful?")
+
+        fb_key_pos = f"fb_pos_{response_id}"
+        fb_key_neg = f"fb_neg_{response_id}"
+
         c1, c2, _ = st.columns([1, 1, 4])
-        if c1.button("👍 Yes", key=f"yes_{hash(query)}"):
-            st.session_state.feedback[query] = "positive"
-            st.success("Thank you!")
-        if c2.button("👎 No", key=f"no_{hash(query)}"):
-            st.session_state.feedback[query] = "negative"
-            st.info("Thank you — recorded for evaluation.")
+
+        if c1.button("👍 Yes", key=fb_key_pos):
+            try:
+                logging_db.log_feedback(response_id, user_id, "positive")
+                st.success("Thank you — feedback saved!")
+            except Exception as e:
+                st.error(f"Failed to save feedback: {e}")
+
+        if c2.button("👎 No", key=fb_key_neg):
+            try:
+                logging_db.log_feedback(response_id, user_id, "negative")
+                st.info("Thank you — feedback saved!")
+            except Exception as e:
+                st.error(f"Failed to save feedback: {e}")
 
     st.divider()
     st.caption(f"Corpus: {chunk_count} chunks | Model: {Config.LLM_MODEL} | Role: {st.session_state.role}")
-
-
 # =========================================================================
 # ADMIN PANELS
 # =========================================================================
@@ -282,6 +343,7 @@ def evaluator_metrics_panel():
             st.error("No chunks in vector store. Ingest documents first.")
             return
 
+        user_id = get_user_id(st.session_state.username)
         rows = []
         with st.spinner("Evaluating queries..."):
             for t in TEST_QUERIES:
@@ -291,6 +353,16 @@ def evaluator_metrics_panel():
                 bm25_results = bm25_baseline(t["query"], all_chunks, top_k=5)
                 bm25_p = precision_at_k([{"text": txt} for txt, _ in bm25_results], t["keywords"], k=5)
 
+                # Persist to DB
+                if user_id:
+                    logging_db.log_evaluation(
+                        evaluator_id=user_id,
+                        test_query=t["query"],
+                        precision_at_5=float(rag_p),
+                        bm25_precision=float(bm25_p),
+                        faithfulness=None
+                    )
+
                 rows.append({
                     "Query": t["query"],
                     "RAG Precision@5": round(rag_p, 3),
@@ -299,6 +371,7 @@ def evaluator_metrics_panel():
                 })
 
         df = pd.DataFrame(rows)
+        st.success("Evaluation complete — results saved to database.")
         st.dataframe(df, use_container_width=True)
         st.metric("Average RAG Precision", f"{df['RAG Precision@5'].mean():.3f}")
         st.metric("Average BM25 Precision", f"{df['BM25 Precision@5'].mean():.3f}")
@@ -311,6 +384,16 @@ def evaluator_metrics_panel():
             mime="text/csv"
         )
 
+    # Show past evaluations
+    st.markdown("---")
+    st.subheader("Past Evaluations")
+    past = logging_db.get_recent_evaluations(limit=20)
+    if past:
+        df_past = pd.DataFrame(past)[["run_at", "evaluator", "test_query", "precision_at_5", "bm25_precision"]]
+        st.dataframe(df_past, use_container_width=True)
+    else:
+        st.info("No evaluations run yet.")        
+
 
 def evaluator_human_review_panel():
     st.header("🧑‍⚖️ Human Evaluation")
@@ -320,39 +403,51 @@ def evaluator_human_review_panel():
         "Two reviewers should score independently to compute Cohen's Kappa."
     )
 
-    reviewer = st.text_input("Reviewer name", placeholder="e.g., Reviewer A")
-    query = st.text_area("Test query", placeholder="Paste the query you tested")
-    answer = st.text_area("Chatbot answer", placeholder="Paste the answer you received")
+    with st.form("human_review_form"):
+        reviewer = st.text_input("Reviewer name", placeholder="e.g., Reviewer A")
+        query = st.text_area("Test query", placeholder="Paste the query you tested")
+        answer = st.text_area("Chatbot answer", placeholder="Paste the answer you received")
 
-    c1, c2, c3 = st.columns(3)
-    acc = c1.slider("Accuracy (1–5)", 1, 5, 3)
-    rel = c2.slider("Relevance (1–5)", 1, 5, 3)
-    cit = c3.slider("Citation quality (1–5)", 1, 5, 3)
+        c1, c2, c3 = st.columns(3)
+        acc = c1.slider("Accuracy (1–5)", 1, 5, 3)
+        rel = c2.slider("Relevance (1–5)", 1, 5, 3)
+        cit = c3.slider("Citation quality (1–5)", 1, 5, 3)
 
-    comment = st.text_area("Comments (optional)")
+        comment = st.text_area("Comments (optional)")
 
-    if st.button("Submit review", type="primary"):
-        if not reviewer or not query:
-            st.error("Please fill in reviewer name and query.")
-        else:
-            st.success("Review recorded!")
-            st.json({
-                "reviewer": reviewer,
-                "query": query,
-                "accuracy": acc,
-                "relevance": rel,
-                "citation": cit,
-                "comment": comment,
-            })
+        submit = st.form_submit_button("Submit review", type="primary")
 
+        if submit:
+            if not reviewer or not query:
+                st.error("Please fill in reviewer name and query.")
+            else:
+                user_id = get_user_id(st.session_state.username)
+                if user_id:
+                    logging_db.log_human_review(
+                        reviewer_id=user_id,
+                        query_text=query,
+                        answer_text=answer,
+                        accuracy_score=acc,
+                        relevance_score=rel,
+                        citation_score=cit,
+                        comments=comment
+                    )
+                    st.success("Review saved to database!")
+                else:
+                    st.error("Could not identify your user account.")
+
+    # Show past reviews
     st.markdown("---")
-    st.caption(
-        "Tip: For your project report, collect reviews from 2 reviewers on the same "
-        "set of queries, then compute Cohen's Kappa using scikit-learn's "
-        "`cohen_kappa_score`."
-    )
-
-
+    st.subheader("Past Reviews")
+    past = logging_db.get_recent_reviews(limit=20)
+    if past:
+        df = pd.DataFrame(past)[[
+            "created_at", "reviewer", "query_text",
+            "accuracy_score", "relevance_score", "citation_score"
+        ]]
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("No human reviews submitted yet.")
 # =========================================================================
 # MAIN ROUTER
 # =========================================================================
