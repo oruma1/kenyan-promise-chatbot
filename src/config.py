@@ -2,21 +2,21 @@
 
 class Config:
     # Embedding model
-    EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+    EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
     EMBEDDING_DIMENSION = 384
 
     # LLM
     LLM_MODEL = "llama3:8b"
     LLM_TEMPERATURE = 0.1
-    LLM_MAX_TOKENS = 512
+    LLM_MAX_TOKENS = 150
 
     # Chunking
-    CHUNK_SIZE = 500
+    CHUNK_SIZE = 300
     CHUNK_OVERLAP = 50
 
     # Retrieval
-    TOP_K = 5
-    SIMILARITY_THRESHOLD = 0.5
+    TOP_K = 3
+    SIMILARITY_THRESHOLD = 0.35
 
     # Promise Filtering
     PROMISE_THRESHOLD = 0.3

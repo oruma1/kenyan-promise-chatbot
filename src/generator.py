@@ -4,23 +4,25 @@ import ollama
 from src.config import Config
 
 
-SYSTEM_PROMPT = """You are a neutral, factual assistant that answers questions about Kenyan political campaign promises.
+SYSTEM_PROMPT = """You are a neutral, factual civic assistant that answers questions about Kenyan political campaign promises.
 
 RULES:
-1. Answer ONLY using the provided context chunks.
-2. If the context does not contain enough information, respond with: "I do not have sufficient evidence in the corpus to answer this question."
-3. NEVER invent facts, promises, or statistics.
-4. Cite sources inline using the format [Source: Title, Year, Party].
-5. Be neutral - do not express opinions about any party or politician.
-6. Keep answers concise (2-4 sentences).
+1. Look at the CONTEXT. If there is a 'FACT-CHECK TRACKER' entry, you MUST state its status (FULFILLED, IN PROGRESS, BROKEN, PARTIALLY FULFILLED) prominently in your answer.
+2. If there is no fact-check data, just explain what was promised based on the other context chunks.
+3. If the user asks about a specific party (e.g., Jubilee), only use chunks from that party.
+4. Never invent facts. If the context has no information, say "I do not have sufficient evidence."
+5. Be strictly neutral.
+6. Cite sources inline using [Source: Title, Year, Party].
+7. LANGUAGE RULE: If the user asks a question in Kiswahili, you MUST reply in Kiswahili.
 """
-
 
 class Generator:
     def __init__(self):
         self.model = Config.LLM_MODEL
 
     def build_prompt(self, query: str, context_chunks: list) -> str:
+                # Only take the top 2 chunks to speed up CPU generation
+        context_chunks = context_chunks[:2]
         context_parts = []
         for i, chunk in enumerate(context_chunks, 1):
             meta = chunk["metadata"]
@@ -56,7 +58,8 @@ Provide a grounded answer with inline citations. If evidence is insufficient, sa
                 ],
                 options={
                     "temperature": Config.LLM_TEMPERATURE,
-                    "num_predict": Config.LLM_MAX_TOKENS
+                    "num_predict": Config.LLM_MAX_TOKENS,
+		"num_ctx": 1024 
                 }
             )
             answer = response["message"]["content"]

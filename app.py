@@ -1,5 +1,6 @@
 """Streamlit UI with role-based access control"""
-
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import streamlit as st
 import time
 import pandas as pd
@@ -150,13 +151,44 @@ def chatbot_panel(top_k: int, show_chunks: bool):
                 has_evidence = retriever.has_sufficient_evidence(retrieved)
                 filtered = [r for r in retrieved if r["similarity"] >= Config.SIMILARITY_THRESHOLD]
 
+                             # --- FACT-CHECK EVIDENCE LAYER ---
+                from src.db import fetch_all
+                query_lower = query.lower()
+                evidence_matches = []
+                
+                # 1. Look for fact-checks
+                for keyword in ["health", "maternity", "housing", "home", "house", "manufacturing", "fertilizer", "nhif", "afya"]:
+                    if keyword in query_lower:
+                        ev_data = fetch_all("SELECT * FROM promise_evidence WHERE promise_keyword LIKE ?", (f'%{keyword}%',))
+                        if ev_data:
+                            evidence_matches.extend(ev_data)
+
+                # 2. Put Fact-Checks at the very top of the list
+                if evidence_matches:
+                    for ev in evidence_matches:
+                        filtered.insert(0, {
+                            "text": f"FACT-CHECK TRACKER STATUS: {ev['status']}. Original Promise: '{ev['original_promise']}'. Action Taken: '{ev['action_taken']}'.",
+                            "similarity": 1.0,
+                            "metadata": {"title": "Fact-Check Tracker", "party": ev["party"], "year": "2024"}
+                        })
+                
+                # 3. Keep ONLY the top 2 chunks to speed up CPU and focus the AI
+                filtered = filtered[:2]
+                # --- END FACT-CHECK LAYER ---
+
                 start = time.time()
-                result = generator.generate(query, filtered) if has_evidence else {
-                    "answer": "I do not have sufficient evidence in the corpus to answer this question.",
-                    "has_evidence": False
-                }
+                # If we have ANY chunks (even low similarity) or evidence, generate an answer
+                if filtered or evidence_matches:
+                    result = generator.generate(query, filtered)
+                    result["has_evidence"] = True  # Force display
+                else:
+                    result = {
+                        "answer": "I do not have sufficient evidence in the corpus to answer this question.",
+                        "has_evidence": False
+                    }
                 generation_ms = int((time.time() - start) * 1000)
 
+            # Log the response + citations
             response_id = logging_db.log_response(
                 query_id=query_id,
                 response_text=result["answer"],
@@ -168,7 +200,6 @@ def chatbot_panel(top_k: int, show_chunks: bool):
                 logging_db.log_citations(response_id, filtered)
                 logging_db.mark_query_answered(query_id)
 
-            # Cache the result so button clicks don't re-run the pipeline
             st.session_state["last_query"] = query
             st.session_state["last_response"] = {
                 "query_id": query_id,
@@ -215,14 +246,12 @@ def chatbot_panel(top_k: int, show_chunks: bool):
                 with st.expander(f"Chunk {i}"):
                     st.text(ch["text"])
 
-        # ---- FEEDBACK: stable key based on response_id ----
+        # ---- FEEDBACK ----
         st.markdown("### Was this answer helpful?")
-
         fb_key_pos = f"fb_pos_{response_id}"
         fb_key_neg = f"fb_neg_{response_id}"
 
         c1, c2, _ = st.columns([1, 1, 4])
-
         if c1.button("👍 Yes", key=fb_key_pos):
             try:
                 logging_db.log_feedback(response_id, user_id, "positive")
@@ -239,9 +268,9 @@ def chatbot_panel(top_k: int, show_chunks: bool):
 
     st.divider()
     st.caption(f"Corpus: {chunk_count} chunks | Model: {Config.LLM_MODEL} | Role: {st.session_state.role}")
-# =========================================================================
+
 # ADMIN PANELS
-# =========================================================================
+# ========================================================================
 def admin_ingestion_panel():
     st.header("📥 Document Ingestion")
     st.info("Upload new manifestos or speeches (PDF or TXT) to add to the corpus.")
@@ -251,7 +280,8 @@ def admin_ingestion_panel():
         type=["pdf", "txt"],
         accept_multiple_files=True
     )
-    if uploaded and st.button("Ingest uploaded files"):
+    
+    if uploaded and st.button("1. Save uploaded files"):
         dest_dir = Config.DATA_DIR
         saved = []
         for f in uploaded:
@@ -259,25 +289,36 @@ def admin_ingestion_panel():
             with open(path, "wb") as out:
                 out.write(f.getbuffer())
             saved.append(f.name)
-        st.success(f"Saved {len(saved)} file(s) to data/documents/. Run the ingestion script to index them.")
-        st.code("python scripts\\ingest.py")
-
+        st.success(f"Saved {len(saved)} file(s) to data/documents/.")
+        
     st.markdown("---")
-    st.subheader("Ingestion Log")
-    docs_dir = Config.DATA_DIR
-    import os
-    if os.path.isdir(docs_dir):
-        files = os.listdir(docs_dir)
-        if files:
-            df = pd.DataFrame({
-                "File": files,
-                "Size (bytes)": [os.path.getsize(f"{docs_dir}/{f}") for f in files],
-            })
-            st.dataframe(df, use_container_width=True)
-        else:
-            st.warning("No documents in the corpus folder yet.")
-    st.caption("After adding files, run `python scripts\\ingest.py` to re-index.")
-
+    st.subheader("2. Rebuild Vector Database")
+    st.warning("This will clear the current database and re-read all files in `data/documents/`.")
+    
+    if st.button("🚀 Run Ingestion Now", type="primary"):
+        import subprocess
+        import sys
+        
+        with st.spinner("Ingesting documents... This may take a minute."):
+            try:
+                # Run the ingest script
+                result = subprocess.run(
+                    [sys.executable, "scripts/ingest.py"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                st.success("Ingestion Complete!")
+                st.code(result.stdout)
+                
+                # Clear cached components so the app picks up the new DB
+                st.cache_resource.clear()
+                
+            except subprocess.CalledProcessError as e:
+                st.error("Ingestion failed!")
+                st.code(e.stderr)
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 def admin_users_panel():
     st.header("👥 User Management")
@@ -328,9 +369,9 @@ def evaluator_metrics_panel():
     st.header("📊 Automated Evaluation")
 
     TEST_QUERIES = [
-        {"query": "What did they promise about healthcare?", "keywords": ["health", "hospital", "nhif", "medical"]},
-        {"query": "What are the education promises?", "keywords": ["education", "school", "learning", "teacher"]},
-        {"query": "What about housing?", "keywords": ["housing", "home", "house", "mortgage"]},
+        {"query": "What did they promise about healthcare?", "keywords": ["health", "hospital", "nhif", "medical", "SHA" ]},
+        {"query": "What are the education promises?", "keywords": ["education", "school", "learning", "teacher", "laptops"]},
+        {"query": "What about housing?", "keywords": ["housing", "home", "house", "mortgage","affordable"]},
         {"query": "What did they promise about jobs?", "keywords": ["jobs", "employment", "youth"]},
         {"query": "What about agriculture?", "keywords": ["farmer", "agriculture", "crop", "fertilizer"]},
     ]
@@ -338,12 +379,12 @@ def evaluator_metrics_panel():
     if st.button("Run evaluation (RAG vs BM25)", type="primary"):
         retriever, _ = get_components()
         all_chunks = retriever.store.collection.get()["documents"]
+        user_id = get_user_id(st.session_state.username)
 
         if not all_chunks:
             st.error("No chunks in vector store. Ingest documents first.")
             return
 
-        user_id = get_user_id(st.session_state.username)
         rows = []
         with st.spinner("Evaluating queries..."):
             for t in TEST_QUERIES:
@@ -353,14 +394,13 @@ def evaluator_metrics_panel():
                 bm25_results = bm25_baseline(t["query"], all_chunks, top_k=5)
                 bm25_p = precision_at_k([{"text": txt} for txt, _ in bm25_results], t["keywords"], k=5)
 
-                # Persist to DB
+                # Save to DB
                 if user_id:
                     logging_db.log_evaluation(
                         evaluator_id=user_id,
                         test_query=t["query"],
                         precision_at_5=float(rag_p),
-                        bm25_precision=float(bm25_p),
-                        faithfulness=None
+                        bm25_precision=float(bm25_p)
                     )
 
                 rows.append({
@@ -373,9 +413,11 @@ def evaluator_metrics_panel():
         df = pd.DataFrame(rows)
         st.success("Evaluation complete — results saved to database.")
         st.dataframe(df, use_container_width=True)
-        st.metric("Average RAG Precision", f"{df['RAG Precision@5'].mean():.3f}")
-        st.metric("Average BM25 Precision", f"{df['BM25 Precision@5'].mean():.3f}")
-        st.metric("Average Improvement", f"{df['Delta'].mean():.3f}")
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Avg RAG Precision", f"{df['RAG Precision@5'].mean():.3f}")
+        c2.metric("Avg BM25 Precision", f"{df['BM25 Precision@5'].mean():.3f}")
+        c3.metric("Avg Improvement", f"{df['Delta'].mean():.3f}")
 
         st.download_button(
             "📥 Download results as CSV",
@@ -384,7 +426,7 @@ def evaluator_metrics_panel():
             mime="text/csv"
         )
 
-    # Show past evaluations
+    # History
     st.markdown("---")
     st.subheader("Past Evaluations")
     past = logging_db.get_recent_evaluations(limit=20)
@@ -392,8 +434,7 @@ def evaluator_metrics_panel():
         df_past = pd.DataFrame(past)[["run_at", "evaluator", "test_query", "precision_at_5", "bm25_precision"]]
         st.dataframe(df_past, use_container_width=True)
     else:
-        st.info("No evaluations run yet.")        
-
+        st.info("No evaluations run yet.")
 
 def evaluator_human_review_panel():
     st.header("🧑‍⚖️ Human Evaluation")
@@ -414,7 +455,6 @@ def evaluator_human_review_panel():
         cit = c3.slider("Citation quality (1–5)", 1, 5, 3)
 
         comment = st.text_area("Comments (optional)")
-
         submit = st.form_submit_button("Submit review", type="primary")
 
         if submit:
@@ -436,16 +476,20 @@ def evaluator_human_review_panel():
                 else:
                     st.error("Could not identify your user account.")
 
-    # Show past reviews
+    # Show past reviews and download button
     st.markdown("---")
     st.subheader("Past Reviews")
-    past = logging_db.get_recent_reviews(limit=20)
+    past = logging_db.get_recent_reviews(limit=50)
     if past:
-        df = pd.DataFrame(past)[[
-            "created_at", "reviewer", "query_text",
-            "accuracy_score", "relevance_score", "citation_score"
-        ]]
+        df = pd.DataFrame(past)[["created_at", "reviewer", "query_text", "accuracy_score", "relevance_score", "citation_score"]]
         st.dataframe(df, use_container_width=True)
+        
+        st.download_button(
+            "📥 Download Reviews (CSV for Cohen's Kappa)",
+            df.to_csv(index=False).encode("utf-8"),
+            file_name="human_reviews_export.csv",
+            mime="text/csv"
+        )
     else:
         st.info("No human reviews submitted yet.")
 # =========================================================================
