@@ -21,12 +21,16 @@ class VectorStore:
             metadatas=metadatas
         )
 
-    def search(self, query_embedding: list, top_k: int = None) -> dict:
+    def search(self, query_embedding: list, top_k: int = None, where: dict = None) -> dict:
         top_k = top_k or Config.TOP_K
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k
-        )
+        query_params = {
+            "query_embeddings": [query_embedding],
+            "n_results": top_k
+        }
+        if where:
+            query_params["where"] = where
+            
+        results = self.collection.query(**query_params)
         return results
 
     def count(self) -> int:

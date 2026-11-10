@@ -9,10 +9,17 @@ class Retriever:
     def __init__(self):
         self.store = VectorStore()
 
-    def retrieve(self, query: str, top_k: int = None) -> list:
+    def retrieve(self, query: str, top_k: int = None, party: str = None) -> list:
         top_k = top_k or Config.TOP_K
         query_emb = EmbeddingGenerator.embed(query)
-        results = self.store.search(query_emb, top_k=top_k)
+        
+        # If a party is specified, apply metadata filtering
+        where_clause = None
+        if party:
+            where_clause = {"party": party}
+            
+        results = self.store.search(query_emb, top_k=top_k, where=where_clause)
+        
         retrieved = []
         if results and results["documents"]:
             for i, doc in enumerate(results["documents"][0]):
