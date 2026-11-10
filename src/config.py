@@ -6,12 +6,12 @@ class Config:
     EMBEDDING_DIMENSION = 384
 
     # LLM
-    LLM_MODEL = "llama3:8b"
+    LLM_MODEL = "llama3.2:3b"
     LLM_TEMPERATURE = 0.1
     LLM_MAX_TOKENS = 150
 
     # Chunking
-    CHUNK_SIZE = 300
+    CHUNK_SIZE = 500
     CHUNK_OVERLAP = 50
 
     # Retrieval
